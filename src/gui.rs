@@ -117,14 +117,18 @@ impl App {
                         self.client_error = Some(err);
                     }
                     ClientEvent::Frame { rgba, width, height } => {
-                        let color_image = egui::ColorImage::from_rgba_unmultiplied(
-                            [width as usize, height as usize],
-                            &rgba,
-                        );
-                        self.client_frame_size = (width, height);
+                        let color_image = egui::ColorImage::from_rgba_unmultiplied([
+                            width as usize,
+                            height as usize,
+                        ], &rgba);
+                        let old_size = self.client_frame_size;
+                        let new_size = (width, height);
+                        // If size changed, recreate texture to avoid partial/cropped updates.
                         match &mut self.client_texture {
-                            Some(tex) => tex.set(color_image, egui::TextureOptions::LINEAR),
-                            None => {
+                            Some(tex) if old_size == new_size && old_size != (0, 0) => {
+                                tex.set(color_image, egui::TextureOptions::LINEAR)
+                            }
+                            _ => {
                                 self.client_texture = Some(ctx.load_texture(
                                     "video_frame",
                                     color_image,
@@ -132,6 +136,7 @@ impl App {
                                 ));
                             }
                         }
+                        self.client_frame_size = new_size;
                     }
                     ClientEvent::Disconnected => {
                         self.client_log.push("Rozłączono.".to_string());

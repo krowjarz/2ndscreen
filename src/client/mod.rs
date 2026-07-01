@@ -172,10 +172,14 @@ pub async fn stream_video(mut stream: TcpStream, tx: UnboundedSender<ClientEvent
         if let Ok(message) = bincode::deserialize::<HostMessage>(&paczka) {
             match message {
                 HostMessage::VideoFrame { dane } | HostMessage::KlatkaObrazu { dane } => {
+                    let _ = tx.send(ClientEvent::Log(format!("Otrzymano pakiet wideo, bajtów: {}", dane.len())));
                     if let Ok(obraz) = image::load_from_memory(&dane) {
                         let rgba = obraz.to_rgba8();
                         let (width, height) = (rgba.width(), rgba.height());
+                        let _ = tx.send(ClientEvent::Log(format!("Dekodowano klatkę {}x{} ({} bajtów)", width, height, rgba.len())));
                         let _ = tx.send(ClientEvent::Frame { rgba: rgba.into_raw(), width, height });
+                    } else {
+                        let _ = tx.send(ClientEvent::Log("Nie udało się zdekodować obrazu z pakietu.".into()));
                     }
                 }
                 HostMessage::VideoHeader { .. } => {}
