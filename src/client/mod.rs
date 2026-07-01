@@ -11,7 +11,7 @@ use crate::protocol::{ClientMessage, HostMessage};
 pub async fn uruchom_klienta() {
     let local_only = std::env::var("SECOND_SCREEN_LOCAL_ONLY")
         .map(|v| v.eq_ignore_ascii_case("1") || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes"))
-        .unwrap_or(true);
+        .unwrap_or(false);
 
     let mut znalezione_hosty = Vec::new();
 
@@ -49,7 +49,7 @@ pub async fn uruchom_klienta() {
     // --- LOGIKA WYBORU ADRESU ---
     if znalezione_hosty.is_empty() {
         println!("Nie znaleziono hostów w sieci automatycznie.");
-        print!("Wpisz adres IP hosta ręcznie (np. 127.0.0.1:8080): ");
+        print!("Wpisz adres IP/hostname hosta ręcznie (np. 127.0.0.1:8080 albo 100.x.x.x:8080): ");
         let _ = io::stdout().flush();
         io::stdin().read_line(&mut reczny_ip).unwrap();
         
