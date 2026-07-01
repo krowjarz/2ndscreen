@@ -5,6 +5,7 @@ use tokio::task::JoinHandle;
 
 use crate::client::{self, ClientEvent};
 use crate::host::{self, config::CaptureConfig, HostEvent};
+use std::sync::{Arc, atomic::AtomicU32, atomic::Ordering};
 
 #[derive(PartialEq, Clone, Copy)]
 enum Screen {
@@ -27,6 +28,7 @@ pub struct App {
     host_width: u32,
     host_height: u32,
     host_fps: u32,
+    host_fps_shared: Option<Arc<AtomicU32>>,
     host_local_only: bool,
     host_rx: Option<UnboundedReceiver<HostEvent>>,
     host_task: Option<JoinHandle<()>>,
@@ -60,6 +62,7 @@ impl App {
             host_width: 1280,
             host_height: 720,
             host_fps: 30,
+            host_fps_shared: None,
             host_local_only: false,
             host_rx: None,
             host_task: None,
@@ -157,11 +160,13 @@ impl App {
         self.host_listen_addr = None;
         self.host_client = None;
 
+        let fps_shared = Arc::new(AtomicU32::new(self.host_fps));
         let cfg = CaptureConfig {
             width: self.host_width,
             height: self.host_height,
-            fps: self.host_fps,
+            fps: fps_shared.clone(),
         };
+        self.host_fps_shared = Some(fps_shared);
         let password = self.host_password.clone();
         let local_only = self.host_local_only;
 
@@ -183,6 +188,7 @@ impl App {
         self.host_rx = None;
         self.host_client = None;
         self.host_listen_addr = None;
+        self.host_fps_shared = None;
         self.screen = Screen::Menu;
     }
 
@@ -282,7 +288,11 @@ impl App {
                 ui.end_row();
 
                 ui.label("FPS:");
-                ui.add(egui::DragValue::new(&mut self.host_fps).range(1..=60));
+                if ui.add(egui::DragValue::new(&mut self.host_fps).range(1..=60)).changed() {
+                    if let Some(shared) = &self.host_fps_shared {
+                        shared.store(self.host_fps, Ordering::Relaxed);
+                    }
+                }
                 ui.end_row();
 
                 ui.label("Tylko lokalnie (bez mDNS/sieci):");
@@ -453,6 +463,11 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_host_events();
         self.poll_client_events(ctx);
+
+        // Ensure latest FPS value from GUI is propagated to the running host (if any).
+        if let Some(shared) = &self.host_fps_shared {
+            shared.store(self.host_fps, Ordering::Relaxed);
+        }
 
         // Podczas aktywnego streamu/hosta odświeżamy w kółko, żeby nowe
         // klatki/logi pojawiały się na bieżąco (dane napływają z zadań

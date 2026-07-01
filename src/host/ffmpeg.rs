@@ -8,6 +8,7 @@ use image::imageops::FilterType;
 use xcap::Monitor;
 
 use crate::host::config::CaptureConfig;
+use std::sync::atomic::Ordering;
 use crate::protocol::HostMessage;
 
 fn rgba_to_bgra(rgba: &[u8]) -> Vec<u8> {
@@ -32,7 +33,7 @@ pub fn start_stream(mut stream: TcpStream, cfg: CaptureConfig) {
 
     let width = cfg.width;
     let height = cfg.height;
-    let fps = cfg.fps.max(1);
+    let fps = cfg.fps.load(Ordering::Relaxed).max(1);
 
     thread::spawn(move || {
         let header = HostMessage::VideoHeader { width, height, fps };

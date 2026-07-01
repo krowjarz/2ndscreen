@@ -1,6 +1,7 @@
 mod client;
 mod host;
 mod protocol;
+mod logging;
 mod gui;
 
 /// Bez #[tokio::main] — eframe blokuje wątek główny własną pętlą zdarzeń

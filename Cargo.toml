@@ -17,3 +17,5 @@ xcap = "0.3"
 image = "0.25"
 local-ip-address = "0.5"
 eframe = "0.29"
+chrono = { version = "0.4", features = ["serde"] }
+scrap = "0.5"

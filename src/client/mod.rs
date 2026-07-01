@@ -5,6 +5,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc::UnboundedSender;
 use mdns_sd::ServiceDaemon;
 use crate::protocol::{ClientMessage, HostMessage};
+use crate::logging;
 
 /// Zdarzenia wysyłane z zadań sieciowych klienta do wątku GUI.
 #[derive(Debug, Clone)]
@@ -136,6 +137,15 @@ pub async fn discover_hosts(local_only: bool, tx: &UnboundedSender<ClientEvent>)
 /// Łączy się z hostem pod `addr` i wysyła hasło.
 pub async fn connect_and_auth(addr: &str, password: &str) -> Result<TcpStream, String> {
     let mut stream = TcpStream::connect(addr).await.map_err(|e| format!("Błąd połączenia: {}", e))?;
+    if let Err(e) = stream.set_nodelay(true) {
+        let msg = format!("[Client] Ostrzeżenie: nie udało się ustawić TCP_NODELAY: {}", e);
+        println!("{}", msg);
+        logging::append_log(&msg);
+    } else {
+        let msg = "[Client] TCP_NODELAY ustawione na true".to_string();
+        println!("{}", msg);
+        logging::append_log(&msg);
+    }
 
     let wiadomosc = ClientMessage::Autoryzacja { haslo: password.to_string() };
     let zserializowana = bincode::serialize(&wiadomosc).map_err(|e| e.to_string())?;
@@ -173,13 +183,16 @@ pub async fn stream_video(mut stream: TcpStream, tx: UnboundedSender<ClientEvent
             match message {
                 HostMessage::VideoFrame { dane } | HostMessage::KlatkaObrazu { dane } => {
                     let _ = tx.send(ClientEvent::Log(format!("Otrzymano pakiet wideo, bajtów: {}", dane.len())));
+                    logging::append_log(&format!("[Client] Otrzymano pakiet wideo, bajtów: {}", dane.len()));
                     if let Ok(obraz) = image::load_from_memory(&dane) {
                         let rgba = obraz.to_rgba8();
                         let (width, height) = (rgba.width(), rgba.height());
                         let _ = tx.send(ClientEvent::Log(format!("Dekodowano klatkę {}x{} ({} bajtów)", width, height, rgba.len())));
+                        logging::append_log(&format!("[Client] Dekodowano klatkę {}x{} ({} bajtów)", width, height, rgba.len()));
                         let _ = tx.send(ClientEvent::Frame { rgba: rgba.into_raw(), width, height });
                     } else {
                         let _ = tx.send(ClientEvent::Log("Nie udało się zdekodować obrazu z pakietu.".into()));
+                        logging::append_log("[Client] Nie udało się zdekodować obrazu z pakietu.");
                     }
                 }
                 HostMessage::VideoHeader { .. } => {}
