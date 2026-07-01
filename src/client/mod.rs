@@ -4,6 +4,11 @@ use tokio::net::TcpStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc::UnboundedSender;
 use mdns_sd::ServiceDaemon;
+<<<<<<< HEAD
+=======
+use std::io::{Read, Write};
+use std::process::{Command, Stdio};
+>>>>>>> c2e43394b39d1c98f8b50794296520f26f6f5267
 use crate::protocol::{ClientMessage, HostMessage};
 
 /// Zdarzenia wysyłane z zadań sieciowych klienta do wątku GUI.
@@ -172,6 +177,28 @@ fn bgra_to_rgba(bgra: &[u8]) -> Vec<u8> {
 pub async fn stream_video(mut stream: TcpStream, tx: UnboundedSender<ClientEvent>) {
     let _ = tx.send(ClientEvent::Connected);
 
+<<<<<<< HEAD
+=======
+    let mut decoder = Command::new("ffmpeg")
+        .args([
+            "-f", "h264",
+            "-i", "-",
+            "-f", "rawvideo",
+            "-pix_fmt", "bgra",
+            "-",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("Nie udało się uruchomić dekodera FFmpeg");
+
+    let mut stdin = decoder.stdin.take().expect("Brak stdin dekodera FFmpeg");
+    let mut stdout = decoder.stdout.take().expect("Brak stdout dekodera FFmpeg");
+    let mut width = 0u32;
+    let mut height = 0u32;
+
+>>>>>>> c2e43394b39d1c98f8b50794296520f26f6f5267
     loop {
         let mut len_buf = [0u8; 4];
         if stream.read_exact(&mut len_buf).await.is_err() {
@@ -188,14 +215,39 @@ pub async fn stream_video(mut stream: TcpStream, tx: UnboundedSender<ClientEvent
 
         if let Ok(message) = bincode::deserialize::<HostMessage>(&paczka) {
             match message {
+<<<<<<< HEAD
                 HostMessage::VideoFrame { dane } | HostMessage::KlatkaObrazu { dane } => {
+=======
+                HostMessage::VideoHeader { width: w, height: h, .. } => {
+                    width = w;
+                    height = h;
+                }
+                HostMessage::VideoFrame { dane } => {
+                    if stdin.write_all(&dane).is_err() || stdin.flush().is_err() {
+                        continue;
+                    }
+
+                    let expected = width as usize * height as usize * 4;
+                    if width > 0 && height > 0 && expected > 0 {
+                        let mut raw = vec![0u8; expected];
+                        if stdout.read_exact(&mut raw).is_ok() {
+                            let rgba = bgra_to_rgba(&raw);
+                            let _ = tx.send(ClientEvent::Frame { rgba, width, height });
+                        }
+                    }
+                }
+                HostMessage::KlatkaObrazu { dane } => {
+>>>>>>> c2e43394b39d1c98f8b50794296520f26f6f5267
                     if let Ok(obraz) = image::load_from_memory(&dane) {
                         let rgba = obraz.to_rgba8();
                         let (width, height) = (rgba.width(), rgba.height());
                         let _ = tx.send(ClientEvent::Frame { rgba: rgba.into_raw(), width, height });
                     }
                 }
+<<<<<<< HEAD
                 HostMessage::VideoHeader { .. } => {}
+=======
+>>>>>>> c2e43394b39d1c98f8b50794296520f26f6f5267
                 _ => {}
             }
         }
