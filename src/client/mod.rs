@@ -183,17 +183,21 @@ pub async fn stream_video(mut stream: TcpStream, tx: UnboundedSender<ClientEvent
             match message {
                 HostMessage::VideoFrame { dane } | HostMessage::KlatkaObrazu { dane } => {
                     let _ = tx.send(ClientEvent::Log(format!("Otrzymano pakiet wideo, bajtów: {}", dane.len())));
-                    logging::append_log(&format!("[Client] Otrzymano pakiet wideo, bajtów: {}", dane.len()));
-                    if let Ok(obraz) = image::load_from_memory(&dane) {
-                        let rgba = obraz.to_rgba8();
-                        let (width, height) = (rgba.width(), rgba.height());
-                        let _ = tx.send(ClientEvent::Log(format!("Dekodowano klatkę {}x{} ({} bajtów)", width, height, rgba.len())));
-                        logging::append_log(&format!("[Client] Dekodowano klatkę {}x{} ({} bajtów)", width, height, rgba.len()));
-                        let _ = tx.send(ClientEvent::Frame { rgba: rgba.into_raw(), width, height });
-                    } else {
-                        let _ = tx.send(ClientEvent::Log("Nie udało się zdekodować obrazu z pakietu.".into()));
-                        logging::append_log("[Client] Nie udało się zdekodować obrazu z pakietu.");
-                    }
+                    let tx_clone = tx.clone();
+
+                    tokio::task::spawn_blocking(move || {
+                        logging::append_log(&format!("[Client] Otrzymano pakiet wideo, bajtów: {}", dane.len()));
+                        if let Ok(obraz) = image::load_from_memory(&dane) {
+                            let rgba = obraz.to_rgba8();
+                            let (width, height) = (rgba.width(), rgba.height());
+                            let log_msg = format!("[Client] Dekodowano klatkę {}x{} ({} bajtów)", width, height, rgba.len());
+                            logging::append_log(&log_msg);
+                            let _ = tx_clone.send(ClientEvent::Frame { rgba: rgba.into_raw(), width, height });
+                        } else {
+                            let _ = tx_clone.send(ClientEvent::Log("Nie udało się zdekodować obrazu z pakietu.".into()));
+                            logging::append_log("[Client] Nie udało się zdekodować obrazu z pakietu.");
+                        }
+                    });
                 }
                 HostMessage::VideoHeader { .. } => {}
                 _ => {}

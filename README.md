@@ -43,7 +43,7 @@ cargo build --release
 
 ### Uruchomienie
 
-`cargo run --release`
+`cargo run`
 
 
 ## 🗺 Plan rozwoju
