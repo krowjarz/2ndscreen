@@ -1,6 +1,6 @@
 # vibecoding go brr
 
-musisz miec cargo oraz rust
+musisz miec cargo oraz rust,  
 zeby wystartowac wpisz to:
 
 ```bash
