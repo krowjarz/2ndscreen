@@ -4,11 +4,6 @@ use tokio::net::TcpStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc::UnboundedSender;
 use mdns_sd::ServiceDaemon;
-<<<<<<< HEAD
-=======
-use std::io::{Read, Write};
-use std::process::{Command, Stdio};
->>>>>>> c2e43394b39d1c98f8b50794296520f26f6f5267
 use crate::protocol::{ClientMessage, HostMessage};
 
 /// Zdarzenia wysyłane z zadań sieciowych klienta do wątku GUI.
@@ -40,8 +35,7 @@ fn build_candidate_hosts() -> Vec<String> {
     candidates.push("localhost".to_string());
 
     if let Ok(ips) = local_ip_address::list_afinet_netifas() {
-        for (name, ip) in ips {
-            let _ = name;
+        for (_name, ip) in ips {
             if let std::net::IpAddr::V4(v4) = ip {
                 if !v4.is_loopback() {
                     let octets = v4.octets();
@@ -54,7 +48,6 @@ fn build_candidate_hosts() -> Vec<String> {
         }
     }
 
-    // Dodaj kilka typowych nazw hostów, jeśli są dostępne lokalnie.
     candidates.push("host".to_string());
     candidates.push("desktop".to_string());
     candidates.push("pc".to_string());
@@ -97,10 +90,7 @@ mod tests {
     }
 }
 
-/// Odkrywa dostępne hosty w sieci lokalnej: najpierw skanowaniem
-/// kandydackich adresów (patrz `build_candidate_hosts`/`probe_host`,
-/// bez zmian względem Twojego ostatniego commitu), potem przez mDNS.
-/// Wynik trafia kanałem `tx` do GUI zamiast do stdin/stdout.
+/// Odkrywa dostępne hosty w sieci lokalnej.
 pub async fn discover_hosts(local_only: bool, tx: &UnboundedSender<ClientEvent>) {
     let mut znalezione_hosty = Vec::new();
     let candidate_hosts = build_candidate_hosts();
@@ -143,8 +133,7 @@ pub async fn discover_hosts(local_only: bool, tx: &UnboundedSender<ClientEvent>)
     let _ = tx.send(ClientEvent::HostsFound(znalezione_hosty));
 }
 
-/// Łączy się z hostem pod `addr` i wysyła hasło. Zwraca gotowy do
-/// odczytu strumień wideo albo opis błędu.
+/// Łączy się z hostem pod `addr` i wysyła hasło.
 pub async fn connect_and_auth(addr: &str, password: &str) -> Result<TcpStream, String> {
     let mut stream = TcpStream::connect(addr).await.map_err(|e| format!("Błąd połączenia: {}", e))?;
 
@@ -162,43 +151,10 @@ pub async fn connect_and_auth(addr: &str, password: &str) -> Result<TcpStream, S
     }
 }
 
-/// Odbiera klatki wideo i przekazuje je jako gotowe bufory RGBA do GUI
-/// (zamiast rysować bezpośrednio w oknie minifb jak poprzednio — GUI
-/// samo zamienia je na teksturę egui).
-fn bgra_to_rgba(bgra: &[u8]) -> Vec<u8> {
-    let mut rgba = Vec::with_capacity(bgra.len());
-    for chunk in bgra.chunks_exact(4) {
-        let [b, g, r, a] = [chunk[0], chunk[1], chunk[2], chunk[3]];
-        rgba.extend_from_slice(&[r, g, b, a]);
-    }
-    rgba
-}
-
+/// Odbiera klatki wideo i przekazuje je jako gotowe bufory RGBA do GUI.
 pub async fn stream_video(mut stream: TcpStream, tx: UnboundedSender<ClientEvent>) {
     let _ = tx.send(ClientEvent::Connected);
 
-<<<<<<< HEAD
-=======
-    let mut decoder = Command::new("ffmpeg")
-        .args([
-            "-f", "h264",
-            "-i", "-",
-            "-f", "rawvideo",
-            "-pix_fmt", "bgra",
-            "-",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("Nie udało się uruchomić dekodera FFmpeg");
-
-    let mut stdin = decoder.stdin.take().expect("Brak stdin dekodera FFmpeg");
-    let mut stdout = decoder.stdout.take().expect("Brak stdout dekodera FFmpeg");
-    let mut width = 0u32;
-    let mut height = 0u32;
-
->>>>>>> c2e43394b39d1c98f8b50794296520f26f6f5267
     loop {
         let mut len_buf = [0u8; 4];
         if stream.read_exact(&mut len_buf).await.is_err() {
@@ -215,39 +171,14 @@ pub async fn stream_video(mut stream: TcpStream, tx: UnboundedSender<ClientEvent
 
         if let Ok(message) = bincode::deserialize::<HostMessage>(&paczka) {
             match message {
-<<<<<<< HEAD
                 HostMessage::VideoFrame { dane } | HostMessage::KlatkaObrazu { dane } => {
-=======
-                HostMessage::VideoHeader { width: w, height: h, .. } => {
-                    width = w;
-                    height = h;
-                }
-                HostMessage::VideoFrame { dane } => {
-                    if stdin.write_all(&dane).is_err() || stdin.flush().is_err() {
-                        continue;
-                    }
-
-                    let expected = width as usize * height as usize * 4;
-                    if width > 0 && height > 0 && expected > 0 {
-                        let mut raw = vec![0u8; expected];
-                        if stdout.read_exact(&mut raw).is_ok() {
-                            let rgba = bgra_to_rgba(&raw);
-                            let _ = tx.send(ClientEvent::Frame { rgba, width, height });
-                        }
-                    }
-                }
-                HostMessage::KlatkaObrazu { dane } => {
->>>>>>> c2e43394b39d1c98f8b50794296520f26f6f5267
                     if let Ok(obraz) = image::load_from_memory(&dane) {
                         let rgba = obraz.to_rgba8();
                         let (width, height) = (rgba.width(), rgba.height());
                         let _ = tx.send(ClientEvent::Frame { rgba: rgba.into_raw(), width, height });
                     }
                 }
-<<<<<<< HEAD
                 HostMessage::VideoHeader { .. } => {}
-=======
->>>>>>> c2e43394b39d1c98f8b50794296520f26f6f5267
                 _ => {}
             }
         }
