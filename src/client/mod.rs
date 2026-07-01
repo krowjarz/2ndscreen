@@ -3,10 +3,86 @@ pub mod input;
 use tokio::net::TcpStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use std::io::{self, Write};
+use std::net::IpAddr;
 use mdns_sd::ServiceDaemon;
 use minifb::{Window, WindowOptions, Key};
 use image::EncodableLayout;
 use crate::protocol::{ClientMessage, HostMessage};
+
+fn build_candidate_hosts() -> Vec<String> {
+    let mut candidates = Vec::new();
+
+    if let Ok(host) = std::env::var("SECOND_SCREEN_HOST") {
+        if !host.trim().is_empty() {
+            candidates.push(host.trim().to_string());
+        }
+    }
+    if let Ok(hosts) = std::env::var("SECOND_SCREEN_HOSTS") {
+        for host in hosts.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            candidates.push(host.to_string());
+        }
+    }
+
+    candidates.push("127.0.0.1".to_string());
+    candidates.push("localhost".to_string());
+
+    if let Ok(ips) = local_ip_address::list_afinet_netifas() {
+        for (name, ip) in ips {
+            let _ = name;
+            if let std::net::IpAddr::V4(v4) = ip {
+                if !v4.is_loopback() {
+                    let octets = v4.octets();
+                    let base = format!("{}.{}.{}", octets[0], octets[1], octets[2]);
+                    for last in [1, 2, 3, 5, 10, 20, 50, 100, 101, 200, 254] {
+                        candidates.push(format!("{}.{}", base, last));
+                    }
+                }
+            }
+        }
+    }
+
+    // Dodaj kilka typowych nazw hostów, jeśli są dostępne lokalnie.
+    candidates.push("host".to_string());
+    candidates.push("desktop".to_string());
+    candidates.push("pc".to_string());
+
+    candidates.sort();
+    candidates.dedup();
+    candidates
+}
+
+async fn probe_host(target: &str, ports: &[u16]) -> Option<String> {
+    for port in ports {
+        let addr = format!("{}:{}", target, port);
+        match tokio::time::timeout(std::time::Duration::from_millis(250), TcpStream::connect(&addr)).await {
+            Ok(Ok(mut stream)) => {
+                let probe = bincode::serialize(&ClientMessage::Autoryzacja { haslo: String::new() }).ok()?;
+                if stream.write_all(&probe).await.is_ok() {
+                    let mut response = vec![0u8; 256];
+                    if let Ok(n) = stream.read(&mut response).await {
+                        if bincode::deserialize::<HostMessage>(&response[..n]).is_ok() {
+                            return Some(addr);
+                        }
+                    }
+                }
+            }
+            Ok(Err(_)) | Err(_) => {}
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_candidate_hosts;
+
+    #[test]
+    fn build_candidate_hosts_contains_local_defaults() {
+        let candidates = build_candidate_hosts();
+        assert!(candidates.iter().any(|host| host == "127.0.0.1"));
+        assert!(candidates.iter().any(|host| host == "localhost"));
+    }
+}
 
 pub async fn uruchom_klienta() {
     let local_only = std::env::var("SECOND_SCREEN_LOCAL_ONLY")
@@ -14,14 +90,23 @@ pub async fn uruchom_klienta() {
         .unwrap_or(false);
 
     let mut znalezione_hosty = Vec::new();
+    let candidate_hosts = build_candidate_hosts();
+
+    println!("[Klient] Szukam hosta po adresach lokalnych i sieciowych...");
+    for host in &candidate_hosts {
+        if let Some(addr) = probe_host(host, &[8080, 8081, 8082, 9090]).await {
+            znalezione_hosty.push((host.clone(), addr.clone()));
+            println!("[Klient] Znaleziono host pod {}", addr);
+        }
+    }
 
     if !local_only {
-        println!("[mDNS] Szukam dostępnych hostów 2ndscreen w sieci lokalnej (czekaj 3s)...");
+        println!("[mDNS] Próbuję również odnaleźć hosta przez mDNS...");
 
         let mdns = ServiceDaemon::new().expect("Nie można uruchomić mDNS");
         let receiver = mdns.browse("_2ndscreen._tcp.local.").expect("Błąd wyszukiwania");
 
-        let koniec_szukania = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let koniec_szukania = std::time::Instant::now() + std::time::Duration::from_secs(2);
         
         while std::time::Instant::now() < koniec_szukania {
             if let Ok(event) = receiver.recv_timeout(std::time::Duration::from_millis(200)) {
