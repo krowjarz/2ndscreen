@@ -4,6 +4,8 @@ use tokio::net::TcpStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc::UnboundedSender;
 use mdns_sd::ServiceDaemon;
+use std::io::{Read, Write};
+use std::process::{Command, Stdio};
 use crate::protocol::{ClientMessage, HostMessage};
 
 /// Zdarzenia wysyłane z zadań sieciowych klienta do wątku GUI.
@@ -160,8 +162,36 @@ pub async fn connect_and_auth(addr: &str, password: &str) -> Result<TcpStream, S
 /// Odbiera klatki wideo i przekazuje je jako gotowe bufory RGBA do GUI
 /// (zamiast rysować bezpośrednio w oknie minifb jak poprzednio — GUI
 /// samo zamienia je na teksturę egui).
+fn bgra_to_rgba(bgra: &[u8]) -> Vec<u8> {
+    let mut rgba = Vec::with_capacity(bgra.len());
+    for chunk in bgra.chunks_exact(4) {
+        let [b, g, r, a] = [chunk[0], chunk[1], chunk[2], chunk[3]];
+        rgba.extend_from_slice(&[r, g, b, a]);
+    }
+    rgba
+}
+
 pub async fn stream_video(mut stream: TcpStream, tx: UnboundedSender<ClientEvent>) {
     let _ = tx.send(ClientEvent::Connected);
+
+    let mut decoder = Command::new("ffmpeg")
+        .args([
+            "-f", "h264",
+            "-i", "-",
+            "-f", "rawvideo",
+            "-pix_fmt", "bgra",
+            "-",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("Nie udało się uruchomić dekodera FFmpeg");
+
+    let mut stdin = decoder.stdin.take().expect("Brak stdin dekodera FFmpeg");
+    let mut stdout = decoder.stdout.take().expect("Brak stdout dekodera FFmpeg");
+    let mut width = 0u32;
+    let mut height = 0u32;
 
     loop {
         let mut len_buf = [0u8; 4];
@@ -177,11 +207,34 @@ pub async fn stream_video(mut stream: TcpStream, tx: UnboundedSender<ClientEvent
             break;
         }
 
-        if let Ok(HostMessage::KlatkaObrazu { dane }) = bincode::deserialize(&paczka) {
-            if let Ok(obraz) = image::load_from_memory(&dane) {
-                let rgba = obraz.to_rgba8();
-                let (width, height) = (rgba.width(), rgba.height());
-                let _ = tx.send(ClientEvent::Frame { rgba: rgba.into_raw(), width, height });
+        if let Ok(message) = bincode::deserialize::<HostMessage>(&paczka) {
+            match message {
+                HostMessage::VideoHeader { width: w, height: h, .. } => {
+                    width = w;
+                    height = h;
+                }
+                HostMessage::VideoFrame { dane } => {
+                    if stdin.write_all(&dane).is_err() || stdin.flush().is_err() {
+                        continue;
+                    }
+
+                    let expected = width as usize * height as usize * 4;
+                    if width > 0 && height > 0 && expected > 0 {
+                        let mut raw = vec![0u8; expected];
+                        if stdout.read_exact(&mut raw).is_ok() {
+                            let rgba = bgra_to_rgba(&raw);
+                            let _ = tx.send(ClientEvent::Frame { rgba, width, height });
+                        }
+                    }
+                }
+                HostMessage::KlatkaObrazu { dane } => {
+                    if let Ok(obraz) = image::load_from_memory(&dane) {
+                        let rgba = obraz.to_rgba8();
+                        let (width, height) = (rgba.width(), rgba.height());
+                        let _ = tx.send(ClientEvent::Frame { rgba: rgba.into_raw(), width, height });
+                    }
+                }
+                _ => {}
             }
         }
     }

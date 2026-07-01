@@ -15,5 +15,7 @@ pub enum ClientMessage {
 pub enum HostMessage {
     AutoryzacjaOk,
     AutoryzacjaBlad,
-    KlatkaObrazu { dane: Vec<u8> }, // Tutaj będą lecieć bajty skompresowanego JPG
+    VideoHeader { width: u32, height: u32, fps: u32 },
+    VideoFrame { dane: Vec<u8> },
+    KlatkaObrazu { dane: Vec<u8> },
 }

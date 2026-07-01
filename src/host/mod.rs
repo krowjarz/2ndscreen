@@ -1,6 +1,7 @@
 pub mod capture;
 pub mod virtual_display;
 pub mod config;
+pub mod ffmpeg;
 
 use tokio::net::TcpListener;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
