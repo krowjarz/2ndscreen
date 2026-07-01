@@ -2,12 +2,20 @@ pub mod input;
 
 use tokio::net::TcpStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use std::io::{self, Write};
-use std::net::IpAddr;
+use tokio::sync::mpsc::UnboundedSender;
 use mdns_sd::ServiceDaemon;
-use minifb::{Window, WindowOptions, Key};
-use image::EncodableLayout;
 use crate::protocol::{ClientMessage, HostMessage};
+
+/// Zdarzenia wysyłane z zadań sieciowych klienta do wątku GUI.
+#[derive(Debug, Clone)]
+pub enum ClientEvent {
+    Log(String),
+    HostsFound(Vec<(String, String)>),
+    Connected,
+    AuthFailed(String),
+    Frame { rgba: Vec<u8>, width: u32, height: u32 },
+    Disconnected,
+}
 
 fn build_candidate_hosts() -> Vec<String> {
     let mut candidates = Vec::new();
@@ -84,165 +92,99 @@ mod tests {
     }
 }
 
-pub async fn uruchom_klienta() {
-    let local_only = std::env::var("SECOND_SCREEN_LOCAL_ONLY")
-        .map(|v| v.eq_ignore_ascii_case("1") || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes"))
-        .unwrap_or(false);
-
+/// Odkrywa dostępne hosty w sieci lokalnej: najpierw skanowaniem
+/// kandydackich adresów (patrz `build_candidate_hosts`/`probe_host`,
+/// bez zmian względem Twojego ostatniego commitu), potem przez mDNS.
+/// Wynik trafia kanałem `tx` do GUI zamiast do stdin/stdout.
+pub async fn discover_hosts(local_only: bool, tx: &UnboundedSender<ClientEvent>) {
     let mut znalezione_hosty = Vec::new();
     let candidate_hosts = build_candidate_hosts();
 
-    println!("[Klient] Szukam hosta po adresach lokalnych i sieciowych...");
+    let _ = tx.send(ClientEvent::Log("Szukam hosta po adresach lokalnych i sieciowych...".into()));
     for host in &candidate_hosts {
         if let Some(addr) = probe_host(host, &[8080, 8081, 8082, 9090]).await {
-            znalezione_hosty.push((host.clone(), addr.clone()));
-            println!("[Klient] Znaleziono host pod {}", addr);
+            if !znalezione_hosty.iter().any(|(_, a): &(String, String)| a == &addr) {
+                znalezione_hosty.push((host.clone(), addr));
+            }
         }
     }
 
     if !local_only {
-        println!("[mDNS] Próbuję również odnaleźć hosta przez mDNS...");
+        let _ = tx.send(ClientEvent::Log("Próbuję również odnaleźć hosta przez mDNS...".into()));
 
-        let mdns = ServiceDaemon::new().expect("Nie można uruchomić mDNS");
-        let receiver = mdns.browse("_2ndscreen._tcp.local.").expect("Błąd wyszukiwania");
+        if let Ok(mdns) = ServiceDaemon::new() {
+            if let Ok(receiver) = mdns.browse("_2ndscreen._tcp.local.") {
+                let koniec_szukania = std::time::Instant::now() + std::time::Duration::from_secs(2);
 
-        let koniec_szukania = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        
-        while std::time::Instant::now() < koniec_szukania {
-            if let Ok(event) = receiver.recv_timeout(std::time::Duration::from_millis(200)) {
-                match event {
-                    mdns_sd::ServiceEvent::ServiceResolved(info) => {
-                        let nazwa = info.get_fullname().to_string();
-                        if let Some(ip) = info.get_addresses().iter().next() {
-                            let adres_pelny = format!("{}:{}", ip, info.get_port());
-                            if !znalezione_hosty.iter().any(|(_, addr)| addr == &adres_pelny) {
-                                znalezione_hosty.push((nazwa, adres_pelny));
+                while std::time::Instant::now() < koniec_szukania {
+                    if let Ok(event) = receiver.recv_timeout(std::time::Duration::from_millis(200)) {
+                        if let mdns_sd::ServiceEvent::ServiceResolved(info) = event {
+                            let nazwa = info.get_fullname().to_string();
+                            if let Some(ip) = info.get_addresses().iter().next() {
+                                let adres_pelny = format!("{}:{}", ip, info.get_port());
+                                if !znalezione_hosty.iter().any(|(_, addr)| addr == &adres_pelny) {
+                                    znalezione_hosty.push((nazwa, adres_pelny));
+                                }
                             }
                         }
                     }
-                    _ => {}
                 }
             }
         }
     } else {
-        println!("[Klient] Tryb lokalny aktywny: pomijam mDNS i sieć/VPN. Wpisz adres ręcznie.");
+        let _ = tx.send(ClientEvent::Log("Tryb lokalny aktywny: pomijam mDNS.".into()));
     }
 
-    let wybrany_host_ip;
-    let mut reczny_ip = String::new();
+    let _ = tx.send(ClientEvent::HostsFound(znalezione_hosty));
+}
 
-    // --- LOGIKA WYBORU ADRESU ---
-    if znalezione_hosty.is_empty() {
-        println!("Nie znaleziono hostów w sieci automatycznie.");
-        print!("Wpisz adres IP/hostname hosta ręcznie (np. 127.0.0.1:8080 albo 100.x.x.x:8080): ");
-        let _ = io::stdout().flush();
-        io::stdin().read_line(&mut reczny_ip).unwrap();
-        
-        let ip = reczny_ip.trim().to_string();
-        if ip.is_empty() {
-            println!("Błąd: Nie podano adresu IP.");
-            return;
-        }
-        wybrany_host_ip = ip;
-    } else {
-        println!("\nZnalezione hosty:");
-        for (i, (nazwa, adres)) in znalezione_hosty.iter().enumerate() {
-            println!("[{}] {} (Adres: {})", i + 1, nazwa, adres);
-        }
+/// Łączy się z hostem pod `addr` i wysyła hasło. Zwraca gotowy do
+/// odczytu strumień wideo albo opis błędu.
+pub async fn connect_and_auth(addr: &str, password: &str) -> Result<TcpStream, String> {
+    let mut stream = TcpStream::connect(addr).await.map_err(|e| format!("Błąd połączenia: {}", e))?;
 
-        print!("Wybierz numer hosta: ");
-        let _ = io::stdout().flush();
-        let mut wybor = String::new();
-        io::stdin().read_line(&mut wybor).unwrap();
-        
-        let indeks: usize = match wybor.trim().parse::<usize>() {
-            Ok(num) if num > 0 && num <= znalezione_hosty.len() => num - 1,
-            _ => {
-                println!("Nieprawidłowy wybór.");
-                return;
-            }
-        };
-        wybrany_host_ip = znalezione_hosty[indeks].1.clone();
-    }
-    // ----------------------------
+    let wiadomosc = ClientMessage::Autoryzacja { haslo: password.to_string() };
+    let zserializowana = bincode::serialize(&wiadomosc).map_err(|e| e.to_string())?;
+    stream.write_all(&zserializowana).await.map_err(|e| format!("Błąd wysyłania hasła: {}", e))?;
 
-    print!("Podaj hasło: ");
-    let _ = io::stdout().flush();
-    let mut wpisane = String::new();
-    io::stdin().read_line(&mut wpisane).unwrap();
-    let podane_haslo = wpisane.trim().to_string();
+    let mut odpowiedz_buf = vec![0u8; 256];
+    let n = stream.read(&mut odpowiedz_buf).await.map_err(|e| format!("Błąd odczytu odpowiedzi: {}", e))?;
 
-    println!("Łączenie z {}...", wybrany_host_ip);
-
-    // Przekazujemy wybrany_host_ip (teraz to zwykły String)
-    if let Ok(mut stream) = TcpStream::connect(&wybrany_host_ip).await {
-        println!("[Klient] Połączono. Wysyłam hasło...");
-        let wiadomosc = ClientMessage::Autoryzacja { haslo: podane_haslo };
-
-        if let Ok(zserializowana) = bincode::serialize(&wiadomosc) {
-            let _ = stream.write_all(&zserializowana).await;
-            
-            let mut odpowiedz_buf = vec![0u8; 256];
-            if let Ok(n) = stream.read(&mut odpowiedz_buf).await {
-                if let Ok(odpowiedz) = bincode::deserialize::<HostMessage>(&odpowiedz_buf[..n]) {
-                    match odpowiedz {
-                        HostMessage::AutoryzacjaOk => {
-                            println!("[Klient] Sukces! Rozpoczynam odbiór streamu...");
-                            odbieraj_wideo(stream).await;
-                        }
-                        HostMessage::AutoryzacjaBlad => {
-                            println!("[Klient] Odmowa dostępu! Złe hasło.");
-                        }
-                        _ => println!("[Klient] Nieoczekiwana odpowiedź."),
-                    }
-                }
-            }
-        }
-    } else {
-        println!("[Klient] Błąd połączenia z podanym adresem.");
+    match bincode::deserialize::<HostMessage>(&odpowiedz_buf[..n]) {
+        Ok(HostMessage::AutoryzacjaOk) => Ok(stream),
+        Ok(HostMessage::AutoryzacjaBlad) => Err("Odmowa dostępu! Złe hasło.".to_string()),
+        _ => Err("Nieoczekiwana odpowiedź hosta.".to_string()),
     }
 }
 
-async fn odbieraj_wideo(mut stream: TcpStream) {
-    let mut window = Window::new(
-        "2ndScreen - Klient",
-        1280,
-        720,
-        WindowOptions {
-            resize: true,
-            ..WindowOptions::default()
-        },
-    ).expect("Nie udało się utworzyć okna");
+/// Odbiera klatki wideo i przekazuje je jako gotowe bufory RGBA do GUI
+/// (zamiast rysować bezpośrednio w oknie minifb jak poprzednio — GUI
+/// samo zamienia je na teksturę egui).
+pub async fn stream_video(mut stream: TcpStream, tx: UnboundedSender<ClientEvent>) {
+    let _ = tx.send(ClientEvent::Connected);
 
-    while window.is_open() && !window.is_key_down(Key::Escape) {
+    loop {
         let mut len_buf = [0u8; 4];
         if stream.read_exact(&mut len_buf).await.is_err() {
-            println!("Host zakończył połączenie.");
+            let _ = tx.send(ClientEvent::Log("Host zakończył połączenie.".into()));
             break;
         }
         let paczka_rozmiar = u32::from_be_bytes(len_buf) as usize;
 
         let mut paczka = vec![0u8; paczka_rozmiar];
         if stream.read_exact(&mut paczka).await.is_err() {
+            let _ = tx.send(ClientEvent::Log("Błąd odczytu klatki.".into()));
             break;
         }
 
         if let Ok(HostMessage::KlatkaObrazu { dane }) = bincode::deserialize(&paczka) {
             if let Ok(obraz) = image::load_from_memory(&dane) {
                 let rgba = obraz.to_rgba8();
-                let (width, height) = (rgba.width() as usize, rgba.height() as usize);
-                
-                let mut buffer: Vec<u32> = Vec::with_capacity(width * height);
-                for pixel in rgba.pixels() {
-                    let a = pixel[3] as u32;
-                    let r = pixel[0] as u32;
-                    let g = pixel[1] as u32;
-                    let b = pixel[2] as u32;
-                    buffer.push((a << 24) | (r << 16) | (g << 8) | b);
-                }
-
-                window.update_with_buffer(&buffer, width, height).unwrap();
+                let (width, height) = (rgba.width(), rgba.height());
+                let _ = tx.send(ClientEvent::Frame { rgba: rgba.into_raw(), width, height });
             }
         }
     }
+
+    let _ = tx.send(ClientEvent::Disconnected);
 }

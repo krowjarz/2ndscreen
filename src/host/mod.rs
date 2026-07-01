@@ -1,69 +1,63 @@
 pub mod capture;
 pub mod virtual_display;
-pub mod ui;
 pub mod config;
 
 use tokio::net::TcpListener;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use std::io::{self, Write};
+use tokio::sync::mpsc::UnboundedSender;
 use mdns_sd::{ServiceDaemon, ServiceInfo};
 use crate::protocol::{ClientMessage, HostMessage};
+use crate::host::config::CaptureConfig;
 
-pub async fn uruchom_hosta() {
-    print!("Ustaw hasło zabezpieczające dla tego ekranu: ");
-    let _ = io::stdout().flush();
-    let mut zabezpieczenie = String::new();
-    io::stdin().read_line(&mut zabezpieczenie).unwrap();
-    let poprawne_haslo = zabezpieczenie.trim().to_string();
+/// Zdarzenia wysyłane z zadania sieciowego hosta do wątku GUI.
+/// GUI odbiera je nieblokująco (`try_recv`) w pętli `update()`.
+#[derive(Debug, Clone)]
+pub enum HostEvent {
+    Log(String),
+    ListenAddr { addr: String, port: u16 },
+    ClientConnected(String),
+    ClientDisconnected,
+}
 
-    // Pobieramy nazwę komputera (Hostname) – jeśli się nie uda, damy domyślną
-    let hostname = hostname::get().unwrap_or_else(|_| "NieznanyHost".into()).into_string().unwrap_or_else(|_| "Host".to_string());
-    println!("Twój hostname to: {}", hostname);
+/// Uruchamia serwer hosta: bind, mDNS, pętla akceptująca klientów.
+/// Zamiast println!/stdin (jak w starej wersji konsolowej) wszystkie
+/// informacje idą kanałem `tx` do GUI. Funkcja jest spawnowana jako
+/// osobny task Tokio i może być przerwana z zewnątrz przez
+/// `JoinHandle::abort()` (patrz `src/gui`).
+pub async fn run_host(cfg: CaptureConfig, password: String, local_only: bool, tx: UnboundedSender<HostEvent>) {
+    virtual_display::stworz_ekran();
 
-    let local_only = std::env::var("SECOND_SCREEN_LOCAL_ONLY")
-        .map(|v| v.eq_ignore_ascii_case("1") || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes"))
-        .unwrap_or(false);
+    let hostname = hostname::get()
+        .unwrap_or_else(|_| "NieznanyHost".into())
+        .into_string()
+        .unwrap_or_else(|_| "Host".to_string());
+    let _ = tx.send(HostEvent::Log(format!("Twój hostname to: {}", hostname)));
 
     let mdns = if local_only {
-        println!("[Host] Tryb lokalny aktywny: nasłuchuję tylko na loopback.");
+        let _ = tx.send(HostEvent::Log("Tryb lokalny aktywny: nasłuchuję tylko na loopback.".into()));
         None
     } else {
-        Some(ServiceDaemon::new().expect("Nie udało się odpalić mDNS"))
+        match ServiceDaemon::new() {
+            Ok(daemon) => Some(daemon),
+            Err(e) => {
+                let _ = tx.send(HostEvent::Log(format!("Nie udało się odpalić mDNS: {}", e)));
+                None
+            }
+        }
     };
     let service_type = "_2ndscreen._tcp.local.";
     let instance_name = format!("{}_screen", hostname);
 
-    println!("Host działa. Aktywuję wirtualny ekran...");
-    virtual_display::stworz_ekran();
-
-    // Domyślnie nie otwieramy okna UI na hoscie — informacje o adresie/porcie są wypisywane w terminalu.
-    let config = if std::env::var_os("SECOND_SCREEN_UI").is_some() {
-        println!("[Host] Uruchamiam okno ustawień (ustaw SECOND_SCREEN_UI=0, aby wyłączyć).");
-        tokio::task::spawn_blocking(|| ui::show_ui())
-            .await
-            .expect("UI task panicked")
-    } else {
-        println!("[Host] Okno ustawień pominięte. Używam domyślnych ustawień: 1280x720 @ 30fps.");
-        config::CaptureConfig::default()
-    };
-
-    println!("[Host] Wybrane ustawienia: {}x{} @ {}fps", config.width, config.height, config.fps);
-
-    // W trybie sieciowym nasłuchujemy na wszystkich interfejsach.
     let default_bind = if local_only { "127.0.0.1:0".to_string() } else { "0.0.0.0:8080".to_string() };
     let mut bind_display = default_bind.clone();
     let listener = match TcpListener::bind(&bind_display).await {
-        Ok(l) => {
-            println!("[Host] Serwer TCP nasłuchuje na {}", bind_display);
-            l
-        }
+        Ok(l) => l,
         Err(e) => {
-            eprintln!("[Host] Nie udało się związać {}: {}", bind_display, e);
+            let _ = tx.send(HostEvent::Log(format!("Nie udało się związać {}: {}", bind_display, e)));
             let fallback_all = "0.0.0.0:0";
             match TcpListener::bind(fallback_all).await {
                 Ok(l2) => {
                     bind_display = fallback_all.to_string();
-                    println!("[Host] Fallback: nasłuchiwanie na {}", bind_display);
                     l2
                 }
                 Err(_) => {
@@ -72,11 +66,11 @@ pub async fn uruchom_hosta() {
                         Ok(l3) => {
                             let local = l3.local_addr().expect("Brak adresu lokalnego");
                             bind_display = format!("{}", local);
-                            println!("[Host] Nasłuchiwanie na przydzielonym porcie: {}", bind_display);
                             l3
                         }
                         Err(e3) => {
-                            panic!("Nie udało się związać gniazda: {}", e3);
+                            let _ = tx.send(HostEvent::Log(format!("Nie udało się związać gniazda: {}", e3)));
+                            return;
                         }
                     }
                 }
@@ -86,6 +80,7 @@ pub async fn uruchom_hosta() {
 
     // Zarejestruj mDNS używając faktycznego portu, na którym nasłuchujemy
     let local_port = listener.local_addr().map(|a| a.port()).unwrap_or(8080);
+    let _ = tx.send(HostEvent::ListenAddr { addr: bind_display.clone(), port: local_port });
 
     let interface_ips = match local_ip_address::list_afinet_netifas() {
         Ok(ips) => ips.into_iter().filter_map(|(_, ip)| match ip {
@@ -102,9 +97,6 @@ pub async fn uruchom_hosta() {
     }
     println!("  - 127.0.0.1:{}", local_port);
     println!("[Host] Dla klienta możesz też użyć: {}:{}", hostname, local_port);
-    if !local_only {
-        println!("[Host] Jeśli używasz Tailscale, wpisz adres z sieci Tailscale (np. 100.x.x.x:{})", local_port);
-    }
     if let Some(mdns) = mdns {
         let my_service = ServiceInfo::new(
             service_type,
@@ -125,13 +117,13 @@ pub async fn uruchom_hosta() {
         if let Ok(n) = stream.read(&mut buffer).await {
             if n > 0 {
                 if let Ok(ClientMessage::Autoryzacja { haslo }) = bincode::deserialize::<ClientMessage>(&buffer[..n]) {
-                    if haslo == poprawne_haslo {
-                        println!("[Host] Hasło poprawne!");
+                    if haslo == password {
+                        let _ = tx.send(HostEvent::Log("[Host] Hasło poprawne!".into()));
                         let odpowiedz = bincode::serialize(&HostMessage::AutoryzacjaOk).unwrap();
                         let _ = stream.write_all(&odpowiedz).await;
-                        capture::start_stream(stream, config).await;
+                        capture::start_stream(stream, cfg);
                     } else {
-                        println!("[Host] BŁĄD: Złe hasło.");
+                        let _ = tx.send(HostEvent::Log("[Host] BŁĄD: Złe hasło.".into()));
                         let odpowiedz = bincode::serialize(&HostMessage::AutoryzacjaBlad).unwrap();
                         let _ = stream.write_all(&odpowiedz).await;
                     }

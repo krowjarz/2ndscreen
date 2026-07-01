@@ -1,44 +1,25 @@
 mod client;
 mod host;
 mod protocol;
+mod gui;
 
-use std::io::{self, Write};
+/// Bez #[tokio::main] — eframe blokuje wątek główny własną pętlą zdarzeń
+/// okna, więc runtime Tokio uruchamiamy ręcznie w tle i przekazujemy do
+/// GUI tylko `Handle`, żeby móc spawnować zadania sieciowe z callbacków UI.
+fn main() -> eframe::Result<()> {
+    let runtime = tokio::runtime::Runtime::new().expect("Nie udało się utworzyć runtime Tokio");
+    let handle = runtime.handle().clone();
 
-#[tokio::main]
-async fn main() {
-    println!("=================================");
-    println!("    Witaj w aplikacji 2ndScreen  ");
-    println!("=================================");
-    println!("Wybierz tryb uruchomienia:");
-    println!("[1] Uruchom jako HOST (Udostępnij ekran)");
-    println!("[2] Uruchom jako KLIENT (Odbierz ekran)");
-    print!("Twój wybór (1 lub 2): ");
+    let options = eframe::NativeOptions {
+        viewport: eframe::egui::ViewportBuilder::default().with_inner_size([960.0, 680.0]),
+        ..Default::default()
+    };
 
-    // Wymuszamy wyświetlenie tekstu zachęty przed wpisaniem danych
-    let _ = io::stdout().flush();
-
-    // Odczytujemy to, co użytkownik wpisze w terminalu
-    let mut wybor = String::new();
-    io::stdin()
-        .read_line(&mut wybor)
-        .expect("Nie udało się odczytać linii");
-
-    // Oczyszczamy tekst z białych znaków i nowej linii (\n)
-    let wybor = wybor.trim();
-
-    println!("---------------------------------");
-
-    match wybor {
-        "1" => {
-            println!("Wybór: HOST. Odpalam serwer...");
-            host::uruchom_hosta().await;
-        }
-        "2" => {
-            println!("Wybór: KLIENT. Łączę z hostem...");
-            client::uruchom_klienta().await;
-        }
-        _ => {
-            println!("Niepoprawny wybór! Uruchom program ponownie i wpisz 1 lub 2.");
-        }
-    }
+    // `runtime` żyje aż do zakończenia run_native (czyli do zamknięcia
+    // okna), więc jego wątki robocze działają przez cały czas życia apki.
+    eframe::run_native(
+        "2ndScreen",
+        options,
+        Box::new(move |_cc| Ok(Box::new(gui::App::new(handle)))),
+    )
 }
