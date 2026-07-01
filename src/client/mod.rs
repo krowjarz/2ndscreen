@@ -9,29 +9,38 @@ use image::EncodableLayout;
 use crate::protocol::{ClientMessage, HostMessage};
 
 pub async fn uruchom_klienta() {
-    println!("[mDNS] Szukam dostępnych hostów 2ndscreen w sieci lokalnej (czekaj 3s)...");
-
-    let mdns = ServiceDaemon::new().expect("Nie można uruchomić mDNS");
-    let receiver = mdns.browse("_2ndscreen._tcp.local.").expect("Błąd wyszukiwania");
+    let local_only = std::env::var("SECOND_SCREEN_LOCAL_ONLY")
+        .map(|v| v.eq_ignore_ascii_case("1") || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes"))
+        .unwrap_or(true);
 
     let mut znalezione_hosty = Vec::new();
-    let koniec_szukania = std::time::Instant::now() + std::time::Duration::from_secs(3);
-    
-    while std::time::Instant::now() < koniec_szukania {
-        if let Ok(event) = receiver.recv_timeout(std::time::Duration::from_millis(200)) {
-            match event {
-                mdns_sd::ServiceEvent::ServiceResolved(info) => {
-                    let nazwa = info.get_fullname().to_string();
-                    if let Some(ip) = info.get_addresses().iter().next() {
-                        let adres_pelny = format!("{}:{}", ip, info.get_port());
-                        if !znalezione_hosty.iter().any(|(_, addr)| addr == &adres_pelny) {
-                            znalezione_hosty.push((nazwa, adres_pelny));
+
+    if !local_only {
+        println!("[mDNS] Szukam dostępnych hostów 2ndscreen w sieci lokalnej (czekaj 3s)...");
+
+        let mdns = ServiceDaemon::new().expect("Nie można uruchomić mDNS");
+        let receiver = mdns.browse("_2ndscreen._tcp.local.").expect("Błąd wyszukiwania");
+
+        let koniec_szukania = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        
+        while std::time::Instant::now() < koniec_szukania {
+            if let Ok(event) = receiver.recv_timeout(std::time::Duration::from_millis(200)) {
+                match event {
+                    mdns_sd::ServiceEvent::ServiceResolved(info) => {
+                        let nazwa = info.get_fullname().to_string();
+                        if let Some(ip) = info.get_addresses().iter().next() {
+                            let adres_pelny = format!("{}:{}", ip, info.get_port());
+                            if !znalezione_hosty.iter().any(|(_, addr)| addr == &adres_pelny) {
+                                znalezione_hosty.push((nazwa, adres_pelny));
+                            }
                         }
                     }
+                    _ => {}
                 }
-                _ => {}
             }
         }
+    } else {
+        println!("[Klient] Tryb lokalny aktywny: pomijam mDNS i sieć/VPN. Wpisz adres ręcznie.");
     }
 
     let wybrany_host_ip;
@@ -39,7 +48,7 @@ pub async fn uruchom_klienta() {
 
     // --- LOGIKA WYBORU ADRESU ---
     if znalezione_hosty.is_empty() {
-        println!("Nie znaleziono hostów w sieci automatycznie (mDNS).");
+        println!("Nie znaleziono hostów w sieci automatycznie.");
         print!("Wpisz adres IP hosta ręcznie (np. 127.0.0.1:8080): ");
         let _ = io::stdout().flush();
         io::stdin().read_line(&mut reczny_ip).unwrap();
