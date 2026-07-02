@@ -1,99 +1,67 @@
-use std::io::{Read, Write};
-use std::net::TcpStream;
-use std::process::{Command, Stdio};
-use std::thread;
-use std::time::Duration;
+// === FILENAME: src/host/ffmpeg.rs ===
+use std::process::{Command, Stdio, Child, ChildStdin, ChildStdout};
+use std::io::{Write, Read};
 
-use image::imageops::FilterType;
-use xcap::Monitor;
-
-use crate::host::config::CaptureConfig;
-use std::sync::atomic::Ordering;
-use crate::protocol::HostMessage;
-
-fn rgba_to_bgra(rgba: &[u8]) -> Vec<u8> {
-    let mut bgra = Vec::with_capacity(rgba.len());
-    for chunk in rgba.chunks_exact(4) {
-        let [r, g, b, a] = [chunk[0], chunk[1], chunk[2], chunk[3]];
-        bgra.extend_from_slice(&[b, g, r, a]);
-    }
-    bgra
+pub struct FfmpegWriter {
+    stdin: ChildStdin,
 }
 
-fn write_message(stream: &mut TcpStream, message: &HostMessage) {
-    if let Ok(payload) = bincode::serialize(message) {
-        let len = payload.len() as u32;
-        let _ = stream.write_all(&len.to_be_bytes());
-        let _ = stream.write_all(&payload);
+impl FfmpegWriter {
+    pub fn write_frame(&mut self, rgb_data: &[u8]) -> Result<(), std::io::Error> {
+        self.stdin.write_all(rgb_data)?;
+        self.stdin.flush()
     }
 }
 
-pub fn start_stream(mut stream: TcpStream, cfg: CaptureConfig) {
-    println!("[FFmpeg] Rozpoczynam stream wideo przez FFmpeg...");
+pub struct FfmpegReader {
+    stdout: ChildStdout,
+}
 
-    let width = cfg.width;
-    let height = cfg.height;
-    let fps = cfg.fps.load(Ordering::Relaxed).max(1);
+impl FfmpegReader {
+    pub fn read_encoded_chunk(&mut self) -> Option<Vec<u8>> {
+        let mut buffer = vec![0u8; 4096]; // bufor na zakodowane pakiety H.264
+        if let Ok(n) = self.stdout.read(&mut buffer) {
+            if n > 0 {
+                buffer.truncate(n);
+                return Some(buffer);
+            }
+        }
+        None
+    }
+}
 
-    thread::spawn(move || {
-        let header = HostMessage::VideoHeader { width, height, fps };
-        write_message(&mut stream, &header);
+pub struct FfmpegEncoder {
+    process: Child,
+}
 
-        let mut ffmpeg = Command::new("ffmpeg")
-            .args([
-                "-f", "rawvideo",
-                "-pix_fmt", "bgra",
-                "-s", &format!("{}x{}", width, height),
-                "-r", &fps.to_string(),
-                "-i", "-",
-                "-c:v", "libx264",
-                "-preset", "ultrafast",
-                "-tune", "zerolatency",
-                "-pix_fmt", "yuv420p",
-                "-f", "h264",
-                "-",
+impl FfmpegEncoder {
+    pub fn new(width: u32, height: u32, fps: u32) -> Result<Self, std::io::Error> {
+        // Uruchamiamy zainstalowany w systemie program ffmpeg
+        let process = Command::new("ffmpeg")
+            .args(&[
+                "-f", "rawvideo",          // wejściowy format to surowe wideo
+                "-pix_fmt", "rgb24",       // format pikseli RGB (3 bajty na piksel)
+                "-s", &format!("{}x{}", width, height), // rozdzielczość ekranu
+                "-r", &fps.to_string(),    // klatki na sekundę
+                "-i", "-",                 // pobieraj dane ze stdin (nasz strumień w Rust)
+                "-c:v", "libx264",         // koder H.264
+                "-preset", "ultrafast",    // maksymalna szybkość, najmniejsze opóźnienie
+                "-tune", "zerolatency",    // optymalizacja pod kątem streamingu live
+                "-f", "h264",              // format wyjściowy to surowy strumień H.264
+                "-"                        // wyrzucaj wynik na stdout (do przechwycenia w Rust)
             ])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("Nie udało się uruchomić FFmpeg");
+            .stderr(Stdio::null())         // ukrywamy logi ffmpeg, żeby nie zaśmiecać konsoli
+            .spawn()?;
 
-        let mut stdin = ffmpeg.stdin.take().expect("Brak stdin FFmpeg");
-        let mut stdout = ffmpeg.stdout.take().expect("Brak stdout FFmpeg");
+        Ok(FfmpegEncoder { process })
+    }
 
-        let monitory = Monitor::all().expect("Nie udało się pobrać listy monitorów");
-        if monitory.is_empty() {
-            println!("[FFmpeg] Brak monitorów, nie mogę rozpocząć streamu.");
-            return;
-        }
-
-        let glowny_monitor = &monitory[0];
-        let frame_delay = if fps > 0 { 1000u64 / fps as u64 } else { 33 };
-
-        loop {
-            if let Ok(klatka) = glowny_monitor.capture_image() {
-                let final_image = if (klatka.width() != width) || (klatka.height() != height) {
-                    image::imageops::resize(&klatka, width, height, FilterType::Lanczos3)
-                } else {
-                    klatka
-                };
-
-                let rgba = final_image.into_raw();
-                let bgra = rgba_to_bgra(&rgba);
-                if stdin.write_all(&bgra).is_err() || stdin.flush().is_err() {
-                    break;
-                }
-
-                let mut chunk = [0u8; 8192];
-                let n = stdout.read(&mut chunk).unwrap_or(0);
-                if n > 0 {
-                    let frame = HostMessage::VideoFrame { dane: chunk[..n].to_vec() };
-                    write_message(&mut stream, &frame);
-                }
-            }
-
-            thread::sleep(Duration::from_millis(frame_delay));
-        }
-    });
+    pub fn split(mut self) -> (FfmpegWriter, FfmpegReader) {
+        (
+            FfmpegWriter { stdin: self.process.stdin.take().unwrap() },
+            FfmpegReader { stdout: self.process.stdout.take().unwrap() },
+        )
+    }
 }

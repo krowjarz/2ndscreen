@@ -181,7 +181,7 @@ pub async fn stream_video(mut stream: TcpStream, tx: UnboundedSender<ClientEvent
 
         if let Ok(message) = bincode::deserialize::<HostMessage>(&paczka) {
             match message {
-                HostMessage::VideoFrame { dane } | HostMessage::KlatkaObrazu { dane } => {
+                HostMessage::KlatkaObrazu { dane } => {
                     let _ = tx.send(ClientEvent::Log(format!("Otrzymano pakiet wideo, bajtów: {}", dane.len())));
                     let tx_clone = tx.clone();
 
@@ -199,7 +199,10 @@ pub async fn stream_video(mut stream: TcpStream, tx: UnboundedSender<ClientEvent
                         }
                     });
                 }
-                HostMessage::VideoHeader { .. } => {}
+                // VideoFrame jest na przyszłość dla H.264, na razie ignorujemy
+                HostMessage::VideoFrame { .. } => {
+                    let _ = tx.send(ClientEvent::Log("Otrzymano nieobsługiwany format klatki (VideoFrame).".into()));
+                }
                 _ => {}
             }
         }

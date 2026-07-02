@@ -50,86 +50,107 @@ pub async fn run_host(cfg: CaptureConfig, password: String, local_only: bool, tx
     let instance_name = format!("{}_screen", hostname);
 
     let default_bind = if local_only { "127.0.0.1:0".to_string() } else { "0.0.0.0:8080".to_string() };
-    let mut bind_display = default_bind.clone();
-    let listener = match TcpListener::bind(&bind_display).await {
-        Ok(l) => l,
-        Err(e) => {
-            let _ = tx.send(HostEvent::Log(format!("Nie udało się związać {}: {}", bind_display, e)));
-            let fallback_all = "0.0.0.0:0";
-            match TcpListener::bind(fallback_all).await {
-                Ok(l2) => {
-                    bind_display = fallback_all.to_string();
-                    l2
-                }
-                Err(_) => {
-                    let fallback_loopback = "127.0.0.1:0";
-                    match TcpListener::bind(fallback_loopback).await {
-                        Ok(l3) => {
-                            let local = l3.local_addr().expect("Brak adresu lokalnego");
-                            bind_display = format!("{}", local);
-                            l3
-                        }
-                        Err(e3) => {
-                            let _ = tx.send(HostEvent::Log(format!("Nie udało się związać gniazda: {}", e3)));
-                            return;
-                        }
-                    }
+    let listener = if let Ok(l) = TcpListener::bind(&default_bind).await {
+        l
+    } else if let Ok(l) = TcpListener::bind("0.0.0.0:0").await {
+        let _ = tx.send(HostEvent::Log(format!("Port {} zajęty, używam losowego.", default_bind.split(':').last().unwrap_or("8080"))));
+        l
+    } else if let Ok(l) = TcpListener::bind("127.0.0.1:0").await {
+        let _ = tx.send(HostEvent::Log("Nie udało się nasłuchiwać na 0.0.0.0, używam tylko loopback.".into()));
+        l
+    } else {
+        let _ = tx.send(HostEvent::Log("Krytyczny błąd: Nie udało się związać żadnego gniazda TCP.".into()));
+        return;
+    };
+    let bind_display = match listener.local_addr() {
+        Ok(addr) => addr.to_string(),
+        Err(_) => "Nieznany adres".to_string(),
+    };
+
+    let local_port = listener.local_addr().map(|a| a.port()).unwrap_or(8080);
+    let _ = tx.send(HostEvent::Log(format!("Serwer TCP nasłuchuje na {}", bind_display)));
+    let _ = tx.send(HostEvent::ListenAddr { addr: bind_display.clone(), port: local_port });
+
+    if let Ok(ips) = local_ip_address::list_afinet_netifas() {
+        for (_, ip) in ips {
+            if let std::net::IpAddr::V4(v4) = ip {
+                if !v4.is_loopback() {
+                    let _ = tx.send(HostEvent::Log(format!("Dostępny adres: {}:{}", v4, local_port)));
                 }
             }
         }
-    };
-
-    // Zarejestruj mDNS używając faktycznego portu, na którym nasłuchujemy
-    let local_port = listener.local_addr().map(|a| a.port()).unwrap_or(8080);
-    let _ = tx.send(HostEvent::ListenAddr { addr: bind_display.clone(), port: local_port });
-
-    let interface_ips = match local_ip_address::list_afinet_netifas() {
-        Ok(ips) => ips.into_iter().filter_map(|(_, ip)| match ip {
-            std::net::IpAddr::V4(v4) if !v4.is_loopback() => Some(v4.to_string()),
-            _ => None,
-        }).collect::<Vec<_>>(),
-        Err(_) => Vec::new(),
-    };
-
-    println!("[Host] Nasłuchuję na: {} (port {})", bind_display, local_port);
-    println!("[Host] Dostępne adresy:");
-    for ip in &interface_ips {
-        println!("  - {}:{}", ip, local_port);
     }
-    println!("  - 127.0.0.1:{}", local_port);
-    println!("[Host] Dla klienta możesz też użyć: {}:{}", hostname, local_port);
-    if let Some(mdns) = mdns {
-        let my_service = ServiceInfo::new(
+    let _ = tx.send(HostEvent::Log(format!("Dla klienta możesz też użyć: {}:{}", hostname, local_port)));
+
+    if let Some(mdns) = &mdns {
+        match ServiceInfo::new(
             service_type,
             &instance_name,
             &format!("{}.local.", hostname),
             "",
             local_port,
             None,
-        ).expect("Błąd tworzenia usługi mDNS");
-        mdns.register(my_service).expect("Nie udało się zarejestrować usługi mDNS");
-        println!("[mDNS] Rozgłaszam usługę w sieci jako: {}.local (port {})", hostname, local_port);
-    }
-
-    if let Ok((mut stream, addr)) = listener.accept().await {
-        println!("[Host] Klient połączył się z: {}", addr);
-
-        let mut buffer = vec![0u8; 1024];
-        if let Ok(n) = stream.read(&mut buffer).await {
-            if n > 0 {
-                if let Ok(ClientMessage::Autoryzacja { haslo }) = bincode::deserialize::<ClientMessage>(&buffer[..n]) {
-                    if haslo == password {
-                        let _ = tx.send(HostEvent::Log("[Host] Hasło poprawne!".into()));
-                        let odpowiedz = bincode::serialize(&HostMessage::AutoryzacjaOk).unwrap();
-                        let _ = stream.write_all(&odpowiedz).await;
-                        capture::start_stream(stream, cfg);
-                    } else {
-                        let _ = tx.send(HostEvent::Log("[Host] BŁĄD: Złe hasło.".into()));
-                        let odpowiedz = bincode::serialize(&HostMessage::AutoryzacjaBlad).unwrap();
-                        let _ = stream.write_all(&odpowiedz).await;
-                    }
+        ) {
+            Ok(service) => {
+                if mdns.register(service).is_ok() {
+                    let _ = tx.send(HostEvent::Log(format!(
+                        "[mDNS] Rozgłaszam usługę jako: {}.local (port {})",
+                        hostname, local_port
+                    )));
                 }
             }
+            Err(e) => {
+                let _ = tx.send(HostEvent::Log(format!("Błąd tworzenia usługi mDNS: {}", e)));
+            }
         }
+    }
+
+    loop {
+        let (mut stream, addr) = match listener.accept().await {
+            Ok(pair) => pair,
+            Err(e) => {
+                let _ = tx.send(HostEvent::Log(format!("Błąd accept: {}", e)));
+                break;
+            }
+        };
+        let _ = tx.send(HostEvent::Log(format!("Klient połączył się z: {}", addr)));
+        let password_clone = password.clone();
+        let tx_clone = tx.clone();
+        let cfg_clone = cfg.clone();
+
+        tokio::spawn(async move {
+            let mut buffer = vec![0u8; 1024];
+            match stream.read(&mut buffer).await {
+                Ok(n) if n > 0 => {
+                    match bincode::deserialize::<ClientMessage>(&buffer[..n]) {
+                        Ok(ClientMessage::Autoryzacja { haslo }) => {
+                            if haslo == password_clone {
+                                let _ = tx_clone.send(HostEvent::Log("Hasło poprawne!".into()));
+                                if let Ok(odpowiedz) = bincode::serialize(&HostMessage::AutoryzacjaOk) {
+                                    if stream.write_all(&odpowiedz).await.is_ok() {
+                                        let _ = tx_clone.send(HostEvent::ClientConnected(addr.to_string()));
+                                        let join_handle = capture::start_stream(stream, cfg_clone, tx_clone);
+                                        let _ = join_handle.await;
+                                        return;
+                                    }
+                                }
+                            } else {
+                                let _ = tx_clone.send(HostEvent::Log("BŁĄD: Złe hasło.".into()));
+                                if let Ok(odpowiedz) = bincode::serialize(&HostMessage::AutoryzacjaBlad) {
+                                    let _ = stream.write_all(&odpowiedz).await;
+                                }
+                            }
+                        }
+                        _ => {
+                            let _ = tx_clone.send(HostEvent::Log("Nieprawidłowa wiadomość od klienta.".into()));
+                        }
+                    }
+                }
+                _ => {
+                    let _ = tx_clone.send(HostEvent::Log("Klient rozłączył się przed autoryzacją.".into()));
+                }
+            }
+            let _ = tx_clone.send(HostEvent::ClientDisconnected);
+        });
     }
 }

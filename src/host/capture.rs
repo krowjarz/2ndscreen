@@ -1,133 +1,140 @@
 ﻿// === FILENAME: src/host/capture.rs ===
-use tokio::net::TcpStream;
-use scrap::{Capturer, Display};
-use std::io::{ErrorKind, Write};
-use std::time::Duration;
-use image::codecs::jpeg::JpegEncoder;
-use image::RgbImage;
-use crate::protocol::HostMessage;
 use crate::host::config::CaptureConfig;
+use crate::host::ffmpeg::FfmpegEncoder;
+use crate::host::HostEvent;
+use crate::logging::append_log;
+use crate::protocol::HostMessage;
+use image::Rgba;
+use std::io::Write;
 use std::sync::atomic::Ordering;
-use crate::logging;
+use std::time::Duration;
+use tokio::net::TcpStream;
+use tokio::sync::mpsc::UnboundedSender;
+use tokio::task::JoinHandle;
+use xcap::Monitor;
 
-fn write_message(stream: &mut std::net::TcpStream, message: &HostMessage) {
-    if let Ok(payload) = bincode::serialize(message) {
-        let len = payload.len() as u32;
-        let _ = stream.write_all(&len.to_be_bytes());
-        let _ = stream.write_all(&payload);
-    }
-}
+pub fn start_stream(stream: TcpStream, cfg: CaptureConfig, tx: UnboundedSender<HostEvent>) -> JoinHandle<()> {
+    println!("[Capture] Inicjalizacja przechwytywania (H.264/FFmpeg)...");
 
-pub fn start_stream(stream: TcpStream, cfg: CaptureConfig) {
-    println!("[Capture] Inicjalizacja przechwytywania ekranu (scrap)...");
-    let mut stream = stream.into_std().expect("Nie udało się zamienić TcpStream na std::net::TcpStream");
-
-    if let Err(e) = stream.set_nodelay(true) {
-        let msg = format!("[Capture] Ostrzeżenie: nie udało się ustawić TCP_NODELAY: {}", e);
-        println!("{}", msg);
-        logging::append_log(&msg);
-    } else {
-        let msg = "[Capture] TCP_NODELAY ustawione na true".to_string();
-        println!("{}", msg);
-        logging::append_log(&msg);
-    }
-
+    // Używamy spawn_blocking, ponieważ operacje na obrazie i enkoderze mogą blokować.
     tokio::task::spawn_blocking(move || {
-        let display = Display::primary().expect("Nie udało się pobrać głównego ekranu");
-        let mut capturer = Capturer::new(display).expect("Nie udało się utworzyć capturera ekranu");
-        let monitor_width = capturer.width();
-        let monitor_height = capturer.height();
-        println!("[Capture] Rozpoczynam stream z monitora: {}x{}", monitor_width, monitor_height);
+        let stream = match stream.into_std() {
+            Ok(s) => s,
+            Err(e) => {
+                let msg = format!("[Capture] Błąd konwersji strumienia: {}", e);
+                append_log(&msg);
+                println!("{}", msg);
+                return;
+            }
+        };
+        let _ = stream.set_nodelay(true);
 
-        let mut jpeg_data = Vec::new();
-        let mut frame_index = 0usize;
+        let encoder = match FfmpegEncoder::new(cfg.width, cfg.height, cfg.fps.load(Ordering::Relaxed)) {
+            Ok(enc) => enc,
+            Err(e) => {
+                let msg = format!("[Capture] Nie udało się uruchomić enkodera FFmpeg: {}", e);
+                append_log(&msg);
+                println!("{}", msg);
+                return;
+            }
+        };
+
+        let (mut writer, mut reader) = encoder.split();
+
+        // Wątek do czytania z stdout FFmpeg i wysyłania do klienta
+        let mut reader_stream = stream.try_clone().expect("Nie udało się sklonować strumienia");
+        let reader_tx = tx.clone();
+        let reader_handle = std::thread::spawn(move || {
+            while let Some(chunk) = reader.read_encoded_chunk() {
+                let wiadomosc = HostMessage::KlatkaObrazu { dane: chunk };
+                if let Ok(payload) = bincode::serialize(&wiadomosc) {
+                    let len = payload.len() as u32;
+                    if reader_stream.write_all(&len.to_be_bytes()).is_err() || reader_stream.write_all(&payload).is_err() {
+                    let msg = "[Capture] Klient (wątek czytający) się rozłączył.";
+                    append_log(msg);
+                    println!("{}", msg);
+                    let _ = reader_tx.send(HostEvent::ClientDisconnected);
+                    break;
+                    }
+                }
+            }
+            let msg = "[Capture] Wątek czytający FFmpeg zakończył działanie.";
+            append_log(msg);
+            println!("{}", msg);
+        });
+
+
+        let monitors = match Monitor::all() {
+            Ok(monitors) => {
+                if monitors.is_empty() {
+                    let msg = "[Capture] Krytyczny błąd: Nie znaleziono żadnych monitorów.";
+                    append_log(msg);
+                    println!("{}", msg);
+                    return;
+                }
+                monitors
+            }
+            Err(e) => {
+                let msg = format!("[Capture] Nie udało się pobrać listy monitorów: {}", e);
+                append_log(&msg);
+                println!("{}", msg);
+                return;
+            }
+        };
+
+        let monitor = monitors.into_iter().find(|m| m.is_primary()).unwrap_or_else(|| {
+            let msg = "[Capture] Nie znaleziono głównego monitora, wybieram pierwszy z listy.";
+            append_log(msg);
+            println!("{}", msg);
+            Monitor::all().unwrap().remove(0)
+        });
 
         loop {
             let loop_start = std::time::Instant::now();
-            let fps = cfg.fps.load(Ordering::Relaxed).max(1);
-            let frame_delay = 1000u64 / fps as u64;
+            let current_fps = cfg.fps.load(Ordering::Relaxed).max(1);
+            let frame_delay = Duration::from_millis(1000 / current_fps as u64);
 
-            let mut encoded = 0usize;
-            let convert_ms;
-            let mut resize_ms = 0u128;
-            let mut encode_ms = 0u128;
-            let mut write_ms = 0u128;
-
-            let frame = loop {
-                match capturer.frame() {
-                    Ok(frame) => break frame,
-                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                        std::thread::sleep(Duration::from_millis(5));
-                        continue;
-                    }
-                    Err(error) => {
-                        let msg = format!("[Capture] Błąd przechwytywania ekranu: {}", error);
-                        println!("{}", msg);
-                        logging::append_log(&msg);
-                        return;
-                    }
+            let frame = match monitor.capture_image() {
+                Ok(frame) => {
+                    append_log("Przechwycono klatkę.");
+                    frame
+                }
+                Err(error) => {
+                    append_log(&format!("[Capture] Błąd przechwytywania: {}", error));
+                    println!("[Capture] Błąd przechwytywania: {}", error);
+                    break;
                 }
             };
 
-            let capture_ms = loop_start.elapsed().as_millis();
-            let convert_start = std::time::Instant::now();
-
-            // Szybka konwersja BGRA (Scrap) do RGB (Image)
-            let mut rgb_data = Vec::with_capacity(monitor_width * monitor_height * 3);
-            for chunk in frame.chunks_exact(4) {
-                // chunk: [B, G, R, A]
-                rgb_data.push(chunk[2]); // R
-                rgb_data.push(chunk[1]); // G
-                rgb_data.push(chunk[0]); // B
-            }
-            
-            let img_buffer = RgbImage::from_raw(monitor_width as u32, monitor_height as u32, rgb_data)
-                .expect("Błąd podczas tworzenia bufora obrazu");
-
-            convert_ms = convert_start.elapsed().as_millis();
-
-            let final_image: RgbImage = if (monitor_width as u32 != cfg.width) || (monitor_height as u32 != cfg.height) {
-                let resize_start = std::time::Instant::now();
-                // UWAGA: Używamy FilterType::Nearest. Jest znacznie szybszy na CPU niż Triangle!
-                let resized = image::imageops::resize(&img_buffer, cfg.width, cfg.height, image::imageops::FilterType::Nearest);
-                resize_ms = resize_start.elapsed().as_millis();
-                resized
+            // xcap zwraca już gotowy `image::RgbaImage`
+            let final_image = if (frame.width() != cfg.width) || (frame.height() != cfg.height) {
+                image::imageops::resize(&frame, cfg.width, cfg.height, image::imageops::FilterType::Nearest)
             } else {
-                img_buffer
+                frame
             };
 
-            let enc_start = std::time::Instant::now();
-            jpeg_data.clear();
-            let mut encoder = JpegEncoder::new_with_quality(&mut jpeg_data, 50); // Lekko podniosłem jakość, skoro oszczędzamy na CPU
-
-            if encoder.encode_image(&final_image).is_ok() {
-                encode_ms = enc_start.elapsed().as_millis();
-                encoded = jpeg_data.len();
-
-                let write_start = std::time::Instant::now();
-                let jpeg_payload = std::mem::take(&mut jpeg_data);
-                let wiadomosc = HostMessage::VideoFrame { dane: jpeg_payload };
-                write_message(&mut stream, &wiadomosc);
-                write_ms = write_start.elapsed().as_millis();
+            // Konwersja RGBA do RGB (ffmpeg oczekuje -pix_fmt rgb24)
+            let mut rgb_data = Vec::with_capacity((cfg.width * cfg.height * 3) as usize);
+            for Rgba([r, g, b, _]) in final_image.pixels() {
+                rgb_data.push(*r);
+                rgb_data.push(*g);
+                rgb_data.push(*b);
             }
 
-            let loop_ms = loop_start.elapsed().as_millis();
-            let info = format!("[Capture] loop_ms={} capture_ms={} convert_ms={} resize_ms={} encode_ms={} write_ms={} fps={} sent_bytes={}", 
-                loop_ms, capture_ms, convert_ms, resize_ms, encode_ms, write_ms, fps, encoded);
-
-            if frame_index % 10 == 0 {
-                logging::append_log(&info);
+            if writer.write_frame(&rgb_data).is_err() {
+                let msg = "[Capture] Błąd zapisu klatki do FFmpeg (prawdopodobnie proces zakończony).";
+                append_log(msg);
+                println!("{}", msg);
+                break;
             }
-            if frame_index % 30 == 0 {
-                println!("{}", info);
-            }
-            
-            frame_index = frame_index.wrapping_add(1);
 
-            let time_spent = loop_start.elapsed().as_millis() as u64;
-            if frame_delay > time_spent {
-                std::thread::sleep(Duration::from_millis(frame_delay - time_spent));
+            let elapsed = loop_start.elapsed();
+            if elapsed < frame_delay {
+                std::thread::sleep(frame_delay - elapsed);
             }
         }
-    });
+        
+        // Czekaj na zakończenie wątku czytającego, aby upewnić się, że wszystkie dane zostały wysłane
+        let _ = reader_handle.join();
+    })
 }
